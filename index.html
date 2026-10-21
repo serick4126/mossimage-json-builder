@@ -406,6 +406,7 @@
       box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.6), 0 8px 10px -6px rgba(0, 0, 0, 0.6);
       background-color: #1e293b;
       cursor: crosshair;
+      touch-action: none;
       border: 1px solid #475569;
     }
 
@@ -1011,7 +1012,7 @@
 
     /* Track last active input for tag insertion */
     document.addEventListener('focusin', (e) => {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+      if (e.target.matches('#summaryCaption, #summaryMeta, .item-caption-input')) {
         lastFocusedInput = e.target;
       }
     });
@@ -1033,6 +1034,7 @@
       summaryCaptionInput.value = summary.caption || "";
 
       renderItems();
+      updatePresetChips();
       resizeCanvasToFit();
       drawCanvas();
       updateJsonPreview();
@@ -1077,9 +1079,21 @@
       appState.height = snapSize(parseNumberOr(imgHeightInput.value, appState.height));
       imgWidthInput.value = appState.width;
       imgHeightInput.value = appState.height;
+      appState.layout_json.items.forEach(it => {
+        if (it.bbox) it.bbox = fitBbox(it.bbox);
+      });
+      renderItems();
+      updatePresetChips();
       resizeCanvasToFit();
       drawCanvas();
       updateJsonPreview();
+    }
+
+    function updatePresetChips() {
+      document.querySelectorAll('#resPresets .chip').forEach(chip => {
+        const match = Number(chip.dataset.w) === appState.width && Number(chip.dataset.h) === appState.height;
+        chip.classList.toggle('active', match);
+      });
     }
 
     function commitGenerationInputs() {
@@ -1419,6 +1433,28 @@
       ];
     }
 
+    // Shift the box inside the image, shrinking it only when it is larger than the image
+    function fitBbox(bbox) {
+      const fit = (min, max, half) => {
+        const size = Math.min(max - min, half * 2);
+        const start = Math.min(Math.max(min, -half), half - size);
+        return [Math.round(start), Math.round(start + size)];
+      };
+      const [ymin, ymax] = fit(bbox[0], bbox[2], appState.height / 2);
+      const [xmin, xmax] = fit(bbox[1], bbox[3], appState.width / 2);
+      return [ymin, xmin, ymax, xmax];
+    }
+
+    // Cut off the part outside the image; null when nothing remains
+    function clipBbox(bbox) {
+      const halfW = appState.width / 2, halfH = appState.height / 2;
+      const clipped = [
+        Math.max(bbox[0], -halfH), Math.max(bbox[1], -halfW),
+        Math.min(bbox[2], halfH), Math.min(bbox[3], halfW)
+      ];
+      return bboxError(clipped) ? null : clipped;
+    }
+
     function drawCanvas() {
       const W = mossCanvas.width;
       const H = mossCanvas.height;
@@ -1517,7 +1553,7 @@
     }
 
     function getHandles(rect) {
-      const s = resizeHandleSize;
+      const s = resizeHandleSize / canvasScale;
       return {
         'tl': { x: rect.x - s/2, y: rect.y - s/2, w: s, h: s },
         'tr': { x: rect.x + rect.w - s/2, y: rect.y - s/2, w: s, h: s },
@@ -1551,7 +1587,8 @@
 
     /* Canvas Mouse Interactions */
     function setupCanvas() {
-      mossCanvas.addEventListener('mousedown', (e) => {
+      mossCanvas.addEventListener('pointerdown', (e) => {
+        if (!e.isPrimary) return;
         const pos = getCanvasMousePos(e);
         dragStartPos = pos;
 
@@ -1587,14 +1624,14 @@
           dragMode = 'move';
           initialBbox = [...items[clickedIndex].bbox];
         } else {
-          // If no item is selected, or clicked empty space, start creating a new bbox for current item
-          if (selectedItemIndex >= 0 && items[selectedItemIndex]) {
+          // Empty space draws a box only for a selected item that has none yet
+          if (selectedItemIndex >= 0 && items[selectedItemIndex] && !items[selectedItemIndex].bbox) {
             dragMode = 'create';
           }
         }
       });
 
-      window.addEventListener('mousemove', (e) => {
+      window.addEventListener('pointermove', (e) => {
         if (!dragMode) return;
         const pos = getCanvasMousePos(e);
         const items = appState.layout_json?.items || [];
@@ -1612,7 +1649,7 @@
             h: Math.abs(pos.y - dragStartPos.y)
           };
           if (rect.w > 5 && rect.h > 5) {
-            item.bbox = canvasRectToBbox(rect);
+            item.bbox = clipBbox(canvasRectToBbox(rect)) || item.bbox;
           }
         } else if (dragMode === 'move') {
           const initRect = bboxToCanvasRect(initialBbox);
@@ -1622,7 +1659,7 @@
             w: initRect.w,
             h: initRect.h
           };
-          item.bbox = canvasRectToBbox(newRect);
+          item.bbox = fitBbox(canvasRectToBbox(newRect));
         } else if (dragMode.startsWith('resize-')) {
           const handle = dragMode.replace('resize-', '');
           const initRect = bboxToCanvasRect(initialBbox);
@@ -1647,7 +1684,7 @@
           }
 
           if (newRect.w > 10 && newRect.h > 10) {
-            item.bbox = canvasRectToBbox(newRect);
+            item.bbox = clipBbox(canvasRectToBbox(newRect)) || item.bbox;
           }
         }
 
@@ -1662,13 +1699,15 @@
         updateJsonPreview();
       });
 
-      window.addEventListener('mouseup', () => {
+      window.addEventListener('pointerup', endDrag);
+      window.addEventListener('pointercancel', endDrag);
+      function endDrag() {
         if (dragMode) {
           dragMode = null;
           initialBbox = null;
           renderItems();
         }
-      });
+      }
 
       window.addEventListener('resize', () => {
         resizeCanvasToFit();
@@ -1743,34 +1782,79 @@
     function handleCsvFile(file) {
       const reader = new FileReader();
       reader.onload = (e) => {
-        const content = e.target.result;
+        const bytes = e.target.result;
+        let content;
+        try {
+          content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        } catch (err) {
+          // Japanese Excel saves CSV as Shift_JIS by default
+          content = new TextDecoder('shift_jis').decode(bytes);
+        }
         parseAndLoadCsv(content);
       };
-      reader.readAsText(file, 'utf-8');
+      reader.readAsArrayBuffer(file);
     }
 
+    function parseCsv(text) {
+      const rows = [];
+      let row = [], field = '', inQuotes = false;
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (inQuotes) {
+          if (c !== '"') field += c;
+          else if (text[i + 1] === '"') { field += '"'; i++; }
+          else inQuotes = false;
+        } else if (c === '"') {
+          inQuotes = true;
+        } else if (c === ',') {
+          row.push(field); field = '';
+        } else if (c === '\n' || c === '\r') {
+          if (c === '\r' && text[i + 1] === '\n') i++;
+          row.push(field); rows.push(row); row = []; field = '';
+        } else {
+          field += c;
+        }
+      }
+      if (field !== '' || row.length > 0) { row.push(field); rows.push(row); }
+      return rows.map(r => r.map(c => c.trim())).filter(r => r.some(c => c));
+    }
+
+    const tagKey = t => JSON.stringify([t.category, t.ja, t.en]);
+
     function parseAndLoadCsv(csvText) {
-      const lines = csvText.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
-      if (lines.length === 0) return;
+      const rows = parseCsv(csvText);
+      if (rows.length === 0) return;
 
       const newTags = [];
-      lines.forEach((line, idx) => {
+      const knownKeys = new Set(getAllTags().map(tagKey));
+      let validRows = 0;
+      rows.forEach((cols, idx) => {
         // Ignore typical headers
-        if (idx === 0 && (line.toLowerCase().includes('category') || line.toLowerCase().includes('english'))) {
+        const head = cols.join(',').toLowerCase();
+        if (idx === 0 && ['category', 'english', 'カテゴリ', '英語'].some(w => head.includes(w))) {
           return;
         }
-        const cols = line.split(',').map(c => c.trim().replace(/^["']|["']$/g, ''));
+        let tag = null;
         if (cols.length >= 3) {
-          newTags.push({ category: cols[0] || 'カスタム', ja: cols[1], en: cols[2] });
+          tag = { category: cols[0] || 'カスタム', ja: cols[1], en: cols[2] };
         } else if (cols.length === 2) {
           // guess ja, en
-          newTags.push({ category: '一般', ja: cols[0], en: cols[1] });
+          tag = { category: '一般', ja: cols[0], en: cols[1] };
         } else if (cols.length === 1 && cols[0]) {
-          newTags.push({ category: '一般', ja: cols[0], en: cols[0] });
+          tag = { category: '一般', ja: cols[0], en: cols[0] };
+        }
+        if (!tag) return;
+        validRows++;
+        const key = tagKey(tag);
+        if (!knownKeys.has(key)) {
+          knownKeys.add(key);
+          newTags.push(tag);
         }
       });
 
-      if (newTags.length > 0) {
+      if (newTags.length === 0 && validRows > 0) {
+        showToast('すべて登録済みのタグでした');
+      } else if (newTags.length > 0) {
         customTags = [...customTags, ...newTags];
         try {
           localStorage.setItem('mossimage_custom_tags', JSON.stringify(customTags));
@@ -1784,11 +1868,12 @@
 
     function exportCsv() {
       const tags = getAllTags();
+      const quote = v => `"${String(v).replace(/"/g, '""')}"`;
       let csvContent = "category,japanese,english\n";
       tags.forEach(t => {
-        csvContent += `"${t.category}","${t.ja}","${t.en}"\n`;
+        csvContent += [t.category, t.ja, t.en].map(quote).join(',') + '\n';
       });
-      downloadFile(csvContent, 'mossimage_tags.csv', 'text/csv;charset=utf-8;');
+      downloadFile('﻿' + csvContent, 'mossimage_tags.csv', 'text/csv;charset=utf-8;');
     }
 
     /* ==========================================================================
@@ -1850,8 +1935,6 @@
       // Resolution Preset Chips
       document.querySelectorAll('#resPresets .chip').forEach(chip => {
         chip.addEventListener('click', (e) => {
-          document.querySelectorAll('#resPresets .chip').forEach(c => c.classList.remove('active'));
-          chip.classList.add('active');
           imgWidthInput.value = chip.dataset.w;
           imgHeightInput.value = chip.dataset.h;
           commitSizeInputs();
@@ -1964,6 +2047,7 @@
         if (e.target.files && e.target.files[0]) {
           handleCsvFile(e.target.files[0]);
         }
+        e.target.value = '';
       });
 
       csvDropZone.addEventListener('dragover', (e) => {
@@ -2096,6 +2180,7 @@
           };
           reader.readAsText(e.target.files[0]);
         }
+        e.target.value = '';
       });
     }
 
